@@ -96,6 +96,8 @@ class ChatBridge(QObject):
         self.last_text_check = ""  # For stability check
         self.stable_count = 0  # Count how many times text is stable
         self.get_chatbots = None  # Function to get current chatbot configs
+        self.expecting_new_response = False  # True after we send a message
+        self.sent_message_time = 0  # Timestamp when we sent
         
     def set_panels(self, panels):
         self.panels = panels
@@ -132,16 +134,18 @@ class ChatBridge(QObject):
             
         # Wait for left panel to respond
         self.waiting_for_panel = 0
+        self.expecting_new_response = True
         self.status_update.emit(f"⏳ Waiting for {left_name} to respond...")
         
-        # Start checking for responses after a delay
-        QTimer.singleShot(5000, lambda: self.check_timer.start(2000))
+        # Start checking for responses after a delay (check every 2.5 seconds)
+        QTimer.singleShot(5000, lambda: self.check_timer.start(2500))
         
     def stop(self):
         """Stop the conversation loop"""
         self.is_running = False
         self.check_timer.stop()
         self.waiting_for_panel = -1
+        self.expecting_new_response = False
         self.status_update.emit("Stopped")
         
     def check_for_responses(self):
@@ -180,7 +184,7 @@ class ChatBridge(QObject):
             
             if (responses.length === 0) {{
                 console.log('No responses found');
-                return JSON.stringify({{count: 0, text: '', streaming: false, debug: 'no responses'}});
+                return JSON.stringify({{count: 0, text: '', streaming: false, hasCompletionIndicators: false, debug: 'no responses'}});
             }}
             
             const lastResponse = responses[responses.length - 1];
@@ -194,31 +198,68 @@ class ChatBridge(QObject):
                 '[class*="loading"]',
                 '[class*="cursor"]',
                 '.animate-pulse',
-                '[data-state="streaming"]'
+                '[data-state="streaming"]',
+                '[data-is-streaming="true"]'
             ];
             let isStreaming = false;
             for (const sel of streamingSelectors) {{
                 if (document.querySelector(sel)) {{
                     isStreaming = true;
+                    console.log('Streaming detected via:', sel);
                     break;
                 }}
             }}
             
-            // Also check if the response is still being updated (for ChatGPT)
+            // Check for Stop button (indicates still generating)
             const buttons = document.querySelectorAll('button');
             for (const btn of buttons) {{
-                if (btn.innerText && btn.innerText.includes('Stop')) {{
+                const btnText = (btn.innerText || '').toLowerCase();
+                const ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
+                if (btnText.includes('stop') || ariaLabel.includes('stop')) {{
                     isStreaming = true;
+                    console.log('Streaming detected: Stop button visible');
                     break;
                 }}
             }}
             
-            console.log('Response check:', {{count: responses.length, textLen: text.length, streaming: isStreaming}});
+            // Check for completion indicators (buttons that appear when response is done)
+            let hasCompletionIndicators = false;
+            const lastResponseContainer = lastResponse.closest('[data-message-id]') || lastResponse.parentElement?.parentElement;
+            if (lastResponseContainer) {{
+                // ChatGPT: Look for copy button, thumbs up/down, regenerate button
+                const completionSelectors = [
+                    'button[aria-label*="Copy"]',
+                    'button[aria-label*="copy"]',
+                    'button[data-testid="copy-turn-action-button"]',
+                    'button[aria-label*="Good response"]',
+                    'button[aria-label*="Bad response"]',
+                    'button[aria-label*="Read aloud"]'
+                ];
+                for (const sel of completionSelectors) {{
+                    if (lastResponseContainer.querySelector(sel) || document.querySelector(sel)) {{
+                        hasCompletionIndicators = true;
+                        console.log('Completion indicator found:', sel);
+                        break;
+                    }}
+                }}
+            }}
+            
+            // Also check globally for these indicators near the last message
+            if (!hasCompletionIndicators) {{
+                // If we find action buttons at the bottom of chat, response is likely complete
+                const actionButtons = document.querySelectorAll('[data-testid="copy-turn-action-button"], button[aria-label*="Copy"]');
+                if (actionButtons.length > 0) {{
+                    hasCompletionIndicators = true;
+                }}
+            }}
+            
+            console.log('Response check:', {{count: responses.length, textLen: text.length, streaming: isStreaming, hasCompletionIndicators: hasCompletionIndicators}});
             
             return JSON.stringify({{
                 count: responses.length,
-                text: text.trim().substring(0, 5000),
-                streaming: isStreaming
+                text: text.trim().substring(0, 8000),
+                streaming: isStreaming,
+                hasCompletionIndicators: hasCompletionIndicators
             }});
         }})();
         """
@@ -236,27 +277,47 @@ class ChatBridge(QObject):
             
             count = data.get('count', 0)
             text = data.get('text', '')
+            is_streaming = data.get('streaming', False)
+            has_completion_indicators = data.get('hasCompletionIndicators', False)
             chatbots = self.get_current_chatbots()
             name = chatbots[panel_index]['name']
             
-            # Use text stability instead of streaming indicators
-            # If text hasn't changed for 2 checks, consider response complete
+            # Simple text stability approach - ignore unreliable streaming detection
             if count > 0 and text:
+                # When expecting a new response, wait for text to change from recorded
+                if self.expecting_new_response:
+                    text_changed = text != self.last_response_text[panel_index]
+                    if text_changed:
+                        print(f"[{name}] New response detected! Starting stability tracking...")
+                        self.expecting_new_response = False
+                        self.stable_count = 0
+                        self.last_text_check = text
+                    else:
+                        print(f"[{name}] Waiting for new response... (current len: {len(text)})")
+                        self.status_update.emit(f"⏳ Waiting for {name} to start responding...")
+                        return
+                
+                # Track text stability (ignore streaming detection - too unreliable)
                 if text == self.last_text_check:
                     self.stable_count += 1
                 else:
                     self.stable_count = 0
                     self.last_text_check = text
+                
+                # Wait for 5 stable checks (~12.5 seconds) to be sure response is complete
+                stability_threshold = 5
+                is_complete = self.stable_count >= stability_threshold
                     
-                print(f"[{name}] Responses: {count}, Stable count: {self.stable_count}, Text len: {len(text)}")
+                print(f"[{name}] Responses: {count}, Stable: {self.stable_count}/{stability_threshold}, Len: {len(text)}")
                 
-                # Response is complete if text is stable for 2 checks (4 seconds)
-                is_complete = self.stable_count >= 2
+                # Update status
+                if self.stable_count > 0 and not is_complete:
+                    self.status_update.emit(f"⏳ {name} responding... verifying ({self.stable_count}/{stability_threshold})")
+                else:
+                    self.status_update.emit(f"⏳ {name} is generating... ({len(text)} chars)")
                 
-                # Check if this is a new, complete response
-                if (count > self.last_response_count[panel_index] and 
-                    is_complete and 
-                    text != self.last_response_text[panel_index]):
+                # Forward when stable
+                if is_complete:
                     
                     print(f"[{name}] ✓ RESPONSE COMPLETE! Forwarding...")
                     
@@ -282,8 +343,11 @@ class ChatBridge(QObject):
                     print(f"[{name}] Sending to {other_name}...")
                     self.send_message(other_index, message_to_send)
                     
-                    # Now wait for the other panel
+                    # Now wait for the other panel - reset counters for fresh detection
                     self.waiting_for_panel = other_index
+                    self.stable_count = 0
+                    self.last_text_check = ""
+                    self.expecting_new_response = True
                     self.status_update.emit(f"⏳ Waiting for {other_name} to respond...")
             else:
                 print(f"[{name}] No responses yet...")
