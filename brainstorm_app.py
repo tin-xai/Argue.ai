@@ -8,9 +8,11 @@ Supports: ChatGPT, DeepSeek, Gemini, Claude
 import sys
 import os
 import json
+from datetime import datetime
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QFrame, QSplitter, QTextEdit, QComboBox
+    QPushButton, QLabel, QFrame, QSplitter, QTextEdit, QComboBox,
+    QFileDialog, QMessageBox
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage
@@ -533,6 +535,7 @@ class ControlPanel(QFrame):
     start_clicked = pyqtSignal(tuple)
     stop_clicked = pyqtSignal()
     llm_changed = pyqtSignal(int, str)  # panel_index, llm_name
+    save_pdf_clicked = pyqtSignal()
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -704,6 +707,16 @@ class ControlPanel(QFrame):
         self.stop_btn.clicked.connect(self.on_stop)
         controls_layout.addWidget(self.stop_btn)
         
+        # Save PDF button
+        self.save_pdf_btn = QPushButton("📄 Save PDF")
+        self.save_pdf_btn.setFixedSize(100, 32)
+        self.save_pdf_btn.setStyleSheet("""
+            QPushButton { background: #6366f1; color: white; border: none; border-radius: 4px; font-weight: bold; font-size: 12px; }
+            QPushButton:hover { background: #4f46e5; }
+        """)
+        self.save_pdf_btn.clicked.connect(self.save_pdf_clicked.emit)
+        controls_layout.addWidget(self.save_pdf_btn)
+        
         layout.addLayout(controls_layout)
         
     def load_examples_from_file(self):
@@ -854,11 +867,295 @@ class MainWindow(QMainWindow):
         self.control_panel.start_clicked.connect(self.bridge.start)
         self.control_panel.stop_clicked.connect(self.bridge.stop)
         self.control_panel.llm_changed.connect(self.on_llm_changed)
+        self.control_panel.save_pdf_clicked.connect(self.save_conversations_to_pdf)
     
     def on_llm_changed(self, panel_index, llm_name):
         """Handle LLM selection change"""
         config = AVAILABLE_CHATBOTS[llm_name]
         self.panels[panel_index].set_chatbot(config)
+    
+    def save_conversations_to_pdf(self):
+        """Save both conversations - extract text and save as HTML+PDF"""
+        # Ask user for save directory
+        save_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Select Directory to Save Conversations",
+            os.path.expanduser("~"),
+            QFileDialog.Option.ShowDirsOnly
+        )
+        
+        if not save_dir:
+            return
+        
+        self.save_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.save_dir = save_dir
+        self.conversations_extracted = []
+        self.chatbots_for_save = self.control_panel.get_selected_chatbots()
+        
+        self.control_panel.update_status("📄 Extracting conversations...")
+        
+        # Extract text from each panel
+        for i, panel in enumerate(self.panels):
+            self.extract_conversation_text(i, panel)
+    
+    def extract_conversation_text(self, panel_index, panel):
+        """Extract conversation text using JavaScript"""
+        config = self.chatbots_for_save[panel_index]
+        
+        # JavaScript to extract all messages (generic approach that works across sites)
+        js_code = """
+        (function() {
+            let messages = [];
+            
+            // Try various selectors for different chat interfaces
+            const messageSelectors = [
+                // ChatGPT
+                '[data-message-author-role]',
+                // Claude
+                '.font-claude-message, .font-user-message, [class*="message"]',
+                // Gemini
+                '.model-response-text, .user-query-text, message-content',
+                // DeepSeek
+                '.ds-markdown, .user-message, [class*="message"]',
+                // Generic
+                '[class*="chat"] [class*="message"]',
+                '[role="article"]',
+                '.message, .chat-message'
+            ];
+            
+            let foundElements = [];
+            for (const sel of messageSelectors) {
+                try {
+                    const elements = document.querySelectorAll(sel);
+                    if (elements.length > 0) {
+                        foundElements = Array.from(elements);
+                        break;
+                    }
+                } catch(e) {}
+            }
+            
+            // If no structured messages found, try to get main content
+            if (foundElements.length === 0) {
+                const mainContent = document.querySelector('main, [role="main"], .chat-container, #chat');
+                if (mainContent) {
+                    return JSON.stringify({
+                        messages: [{role: 'content', text: mainContent.innerText}],
+                        raw: mainContent.innerText.substring(0, 50000)
+                    });
+                }
+            }
+            
+            // Extract text from found elements
+            foundElements.forEach((el, idx) => {
+                const text = (el.innerText || el.textContent || '').trim();
+                if (text.length > 10) {
+                    // Try to determine if user or assistant
+                    let role = 'message';
+                    const roleAttr = el.getAttribute('data-message-author-role');
+                    if (roleAttr) {
+                        role = roleAttr;
+                    } else if (el.className.includes('user') || el.className.includes('human')) {
+                        role = 'user';
+                    } else if (el.className.includes('assistant') || el.className.includes('model') || el.className.includes('claude')) {
+                        role = 'assistant';
+                    }
+                    messages.push({role: role, text: text.substring(0, 10000)});
+                }
+            });
+            
+            return JSON.stringify({messages: messages, count: messages.length});
+        })();
+        """
+        
+        panel.browser.page().runJavaScript(
+            js_code,
+            lambda result, idx=panel_index: self.on_conversation_extracted(idx, result)
+        )
+    
+    def on_conversation_extracted(self, panel_index, result):
+        """Handle extracted conversation text"""
+        config = self.chatbots_for_save[panel_index]
+        llm_name = config['name']
+        
+        try:
+            data = json.loads(result) if result else {'messages': [], 'raw': ''}
+            messages = data.get('messages', [])
+            raw_text = data.get('raw', '')
+            
+            # Store the extracted data
+            self.conversations_extracted.append({
+                'index': panel_index,
+                'name': llm_name,
+                'color': config['color'],
+                'messages': messages,
+                'raw': raw_text
+            })
+            
+            print(f"✓ Extracted {len(messages)} messages from {llm_name}")
+            
+        except Exception as e:
+            print(f"✗ Error extracting from {llm_name}: {e}")
+            self.conversations_extracted.append({
+                'index': panel_index,
+                'name': llm_name,
+                'color': config['color'],
+                'messages': [],
+                'raw': ''
+            })
+        
+        # When all panels are extracted, save the file
+        if len(self.conversations_extracted) >= len(self.panels):
+            self.save_combined_conversation()
+    
+    def save_combined_conversation(self):
+        """Save all conversations to a combined HTML file"""
+        # Sort by panel index
+        self.conversations_extracted.sort(key=lambda x: x['index'])
+        
+        # Generate HTML
+        html_content = self.generate_conversation_html()
+        
+        # Save HTML file
+        html_filename = os.path.join(self.save_dir, f"conversation_{self.save_timestamp}.html")
+        
+        try:
+            with open(html_filename, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+            print(f"✓ Saved conversation to: {html_filename}")
+            
+            QMessageBox.information(
+                self,
+                "Conversation Saved",
+                f"Conversation saved to:\n{html_filename}\n\nOpen in browser and print to PDF if needed."
+            )
+            self.control_panel.update_status("✓ Conversation saved as HTML")
+            
+        except Exception as e:
+            print(f"✗ Error saving: {e}")
+            QMessageBox.warning(self, "Error", f"Failed to save: {e}")
+    
+    def generate_conversation_html(self):
+        """Generate a nicely formatted HTML document"""
+        chatbots = self.chatbots_for_save
+        
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>AI Brainstorm Conversation - {self.save_timestamp}</title>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #1a1a2e;
+            color: #eee;
+        }}
+        h1 {{
+            text-align: center;
+            color: #fff;
+            border-bottom: 2px solid #333;
+            padding-bottom: 20px;
+        }}
+        .panels {{
+            display: flex;
+            gap: 20px;
+        }}
+        .panel {{
+            flex: 1;
+            background: #16213e;
+            border-radius: 10px;
+            padding: 20px;
+        }}
+        .panel-header {{
+            font-size: 18px;
+            font-weight: bold;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid;
+        }}
+        .message {{
+            margin: 10px 0;
+            padding: 12px;
+            border-radius: 8px;
+            background: #1a1a2e;
+        }}
+        .message.user {{
+            background: #2d4a7c;
+            border-left: 3px solid #5b8dee;
+        }}
+        .message.assistant {{
+            background: #1e3a3a;
+            border-left: 3px solid #4ecdc4;
+        }}
+        .role {{
+            font-size: 11px;
+            text-transform: uppercase;
+            color: #888;
+            margin-bottom: 5px;
+        }}
+        .text {{
+            white-space: pre-wrap;
+            line-height: 1.5;
+        }}
+        .timestamp {{
+            text-align: center;
+            color: #666;
+            margin-top: 30px;
+            font-size: 12px;
+        }}
+    </style>
+</head>
+<body>
+    <h1>🧠 AI Brainstorm Conversation</h1>
+    <div class="panels">
+"""
+        
+        for conv in self.conversations_extracted:
+            html += f"""
+        <div class="panel">
+            <div class="panel-header" style="border-color: {conv['color']}; color: {conv['color']};">
+                {conv['name']}
+            </div>
+"""
+            
+            if conv['messages']:
+                for msg in conv['messages']:
+                    role_class = msg['role'] if msg['role'] in ['user', 'assistant'] else 'message'
+                    role_display = msg['role'].upper()
+                    text = msg['text'].replace('<', '&lt;').replace('>', '&gt;')
+                    html += f"""
+            <div class="message {role_class}">
+                <div class="role">{role_display}</div>
+                <div class="text">{text}</div>
+            </div>
+"""
+            elif conv['raw']:
+                text = conv['raw'].replace('<', '&lt;').replace('>', '&gt;')
+                html += f"""
+            <div class="message">
+                <div class="text">{text}</div>
+            </div>
+"""
+            else:
+                html += """
+            <div class="message">
+                <div class="text">(No conversation content extracted)</div>
+            </div>
+"""
+            
+            html += """
+        </div>
+"""
+        
+        html += f"""
+    </div>
+    <div class="timestamp">Saved: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</div>
+</body>
+</html>
+"""
+        return html
 
 
 def main():
