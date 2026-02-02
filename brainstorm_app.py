@@ -1,0 +1,681 @@
+#!/usr/bin/env python3
+"""
+AI Brainstorm Panel - ChatGPT ↔ DeepSeek Auto-Conversation
+G2G-style peer-to-peer communication between two AI chatbots
+"""
+
+import sys
+import os
+import json
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QFrame, QSplitter, QTextEdit, QComboBox
+)
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage
+from PyQt6.QtCore import Qt, QUrl, QTimer, pyqtSignal, QObject
+from PyQt6.QtGui import QColor, QPalette
+
+
+# Get the directory where this script is located
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+EXAMPLES_FILE = os.path.join(SCRIPT_DIR, "examples.json")
+
+
+# Persistent storage directory
+STORAGE_DIR = os.path.expanduser("~/.brainstorm_panel")
+
+# Chatbot configurations
+CHATBOTS = [
+    {
+        "name": "ChatGPT",
+        "url": "https://chat.openai.com",
+        "color": "#10a37f",
+        "icon": "◉",
+        "input_selector": "#prompt-textarea",
+        "send_selector": "button[data-testid='send-button']",
+        "response_selector": "[data-message-author-role='assistant']",
+    },
+    {
+        "name": "DeepSeek", 
+        "url": "https://chat.deepseek.com",
+        "color": "#3b82f6",
+        "icon": "◆",
+        # Multiple selectors to try
+        "input_selector": "textarea, #chat-input, [contenteditable='true']",
+        "send_selector": "button[type='submit'], button:has(svg), div[role='button']",
+        "response_selector": ".ds-markdown, .message-content, [class*='answer'], [class*='response']",
+    },
+]
+
+# Template for forwarding messages (G2G style)
+FORWARD_TEMPLATE = """The response from the opposite party:
+
+{message}"""
+
+
+class ChatBridge(QObject):
+    """Handles G2G-style communication between the two chatbot panels"""
+    message_received = pyqtSignal(int, str)
+    status_update = pyqtSignal(str)
+    
+    def __init__(self):
+        super().__init__()
+        self.is_running = False
+        self.panels = []
+        self.last_response_count = [0, 0]
+        self.last_response_text = ["", ""]
+        self.check_timer = QTimer()
+        self.check_timer.timeout.connect(self.check_for_responses)
+        self.waiting_for_panel = -1  # Which panel we're waiting for (-1 = none)
+        self.deepseek_initial_prompt = ""  # Store DeepSeek prompt for later
+        self.last_text_check = ""  # For stability check
+        self.stable_count = 0  # Count how many times text is stable
+        
+    def set_panels(self, panels):
+        self.panels = panels
+        
+    def start(self, initial_prompts):
+        """Start the conversation - send to ChatGPT first, wait for response"""
+        self.is_running = True
+        self.last_response_count = [0, 0]
+        self.last_response_text = ["", ""]
+        self.stable_count = 0
+        self.last_text_check = ""
+        
+        # Store DeepSeek prompt for later (will be sent after ChatGPT responds)
+        prompt1, prompt2 = initial_prompts
+        self.deepseek_initial_prompt = prompt2
+        
+        # Only send to ChatGPT first
+        if prompt1.strip():
+            print("[Start] Sending initial prompt to ChatGPT only...")
+            self.send_message(0, prompt1)
+            
+        # Wait for ChatGPT to respond
+        self.waiting_for_panel = 0
+        self.status_update.emit("⏳ Waiting for ChatGPT to respond...")
+        
+        # Start checking for responses after a delay
+        QTimer.singleShot(5000, lambda: self.check_timer.start(2000))
+        
+    def stop(self):
+        """Stop the conversation loop"""
+        self.is_running = False
+        self.check_timer.stop()
+        self.waiting_for_panel = -1
+        self.status_update.emit("Stopped")
+        
+    def check_for_responses(self):
+        """Check the panel we're waiting for"""
+        if not self.is_running or self.waiting_for_panel < 0:
+            return
+            
+        self.check_panel_response(self.waiting_for_panel)
+            
+    def check_panel_response(self, index):
+        """Check if a panel has a new complete response"""
+        if index >= len(self.panels):
+            return
+            
+        panel = self.panels[index]
+        config = CHATBOTS[index]
+        name = config['name']
+        
+        # JavaScript to get the last response and check if streaming
+        js_code = f"""
+        (function() {{
+            // Try multiple response selectors
+            const selectors = "{config['response_selector']}".split(', ');
+            let responses = [];
+            for (const sel of selectors) {{
+                try {{
+                    const found = document.querySelectorAll(sel);
+                    if (found.length > 0) {{
+                        responses = found;
+                        console.log('Found responses with selector:', sel, found.length);
+                        break;
+                    }}
+                }} catch(e) {{}}
+            }}
+            
+            if (responses.length === 0) {{
+                console.log('No responses found');
+                return JSON.stringify({{count: 0, text: '', streaming: false, debug: 'no responses'}});
+            }}
+            
+            const lastResponse = responses[responses.length - 1];
+            const text = lastResponse.innerText || lastResponse.textContent || '';
+            
+            // Check if still streaming (multiple indicators)
+            const streamingSelectors = [
+                '.result-streaming',
+                '[class*="streaming"]',
+                '[class*="typing"]', 
+                '[class*="loading"]',
+                '[class*="cursor"]',
+                '.animate-pulse',
+                '[data-state="streaming"]'
+            ];
+            let isStreaming = false;
+            for (const sel of streamingSelectors) {{
+                if (document.querySelector(sel)) {{
+                    isStreaming = true;
+                    break;
+                }}
+            }}
+            
+            // Also check if the response is still being updated (for ChatGPT)
+            const buttons = document.querySelectorAll('button');
+            for (const btn of buttons) {{
+                if (btn.innerText && btn.innerText.includes('Stop')) {{
+                    isStreaming = true;
+                    break;
+                }}
+            }}
+            
+            console.log('Response check:', {{count: responses.length, textLen: text.length, streaming: isStreaming}});
+            
+            return JSON.stringify({{
+                count: responses.length,
+                text: text.trim().substring(0, 5000),
+                streaming: isStreaming
+            }});
+        }})();
+        """
+        
+        panel.browser.page().runJavaScript(js_code, lambda result: self.handle_response_check(index, result))
+        
+    def handle_response_check(self, panel_index, result):
+        """Handle the result of checking for a response"""
+        if not self.is_running or not result:
+            return
+            
+        try:
+            import json
+            data = json.loads(result)
+            
+            count = data.get('count', 0)
+            text = data.get('text', '')
+            name = CHATBOTS[panel_index]['name']
+            
+            # Use text stability instead of streaming indicators
+            # If text hasn't changed for 2 checks, consider response complete
+            if count > 0 and text:
+                if text == self.last_text_check:
+                    self.stable_count += 1
+                else:
+                    self.stable_count = 0
+                    self.last_text_check = text
+                    
+                print(f"[{name}] Responses: {count}, Stable count: {self.stable_count}, Text len: {len(text)}")
+                
+                # Response is complete if text is stable for 2 checks (4 seconds)
+                is_complete = self.stable_count >= 2
+                
+                # Check if this is a new, complete response
+                if (count > self.last_response_count[panel_index] and 
+                    is_complete and 
+                    text != self.last_response_text[panel_index]):
+                    
+                    print(f"[{name}] ✓ RESPONSE COMPLETE! Forwarding...")
+                    
+                    self.last_response_count[panel_index] = count
+                    self.last_response_text[panel_index] = text
+                    self.stable_count = 0
+                    self.last_text_check = ""
+                    
+                    # Notify UI
+                    self.message_received.emit(panel_index, text[:80] + "..." if len(text) > 80 else text)
+                    
+                    # Forward to the other panel
+                    other_index = 1 - panel_index
+                    other_name = CHATBOTS[other_index]['name']
+                    
+                    # For the first ChatGPT response, send DeepSeek's initial prompt + ChatGPT's response
+                    if panel_index == 0 and self.deepseek_initial_prompt:
+                        message_to_send = self.deepseek_initial_prompt + "\n\nThe first round from the opposite party:\n\n" + text
+                        self.deepseek_initial_prompt = ""  # Clear it
+                    else:
+                        message_to_send = FORWARD_TEMPLATE.format(message=text)
+                    
+                    print(f"[{name}] Sending to {other_name}...")
+                    self.send_message(other_index, message_to_send)
+                    
+                    # Now wait for the other panel
+                    self.waiting_for_panel = other_index
+                    self.status_update.emit(f"⏳ Waiting for {other_name} to respond...")
+            else:
+                print(f"[{name}] No responses yet...")
+                    
+        except Exception as e:
+            print(f"Error parsing response: {e}")
+            self.status_update.emit(f"Error: {str(e)[:30]}")
+            
+    def send_message(self, panel_index, message):
+        """Send a message to a specific panel"""
+        if panel_index >= len(self.panels):
+            return
+            
+        panel = self.panels[panel_index]
+        config = CHATBOTS[panel_index]
+        name = config['name']
+        
+        self.status_update.emit(f"📤 Sending to {name}...")
+        
+        # Escape for JavaScript
+        escaped = message.replace('\\', '\\\\').replace('`', '\\`').replace('${', '\\${')
+        escaped = escaped.replace('\n', '\\n').replace('\r', '').replace("'", "\\'")
+        
+        js_code = f"""
+        (function() {{
+            // Try multiple input selectors
+            const inputSelectors = "{config['input_selector']}".split(', ');
+            let input = null;
+            for (const sel of inputSelectors) {{
+                input = document.querySelector(sel);
+                if (input) break;
+            }}
+            
+            if (!input) {{
+                console.log('No input found with selectors:', inputSelectors);
+                return 'no input';
+            }}
+            
+            console.log('Found input:', input);
+            
+            const text = `{escaped}`;
+            
+            // Focus and clear
+            input.focus();
+            input.select && input.select();
+            
+            // Method 1: Use execCommand insertText (works with React)
+            document.execCommand('selectAll', false, null);
+            document.execCommand('insertText', false, text);
+            
+            // Method 2: If that didn't work, try DataTransfer (paste simulation)
+            if (!input.value && !input.innerText) {{
+                const dt = new DataTransfer();
+                dt.setData('text/plain', text);
+                const pasteEvent = new ClipboardEvent('paste', {{
+                    clipboardData: dt,
+                    bubbles: true,
+                    cancelable: true
+                }});
+                input.dispatchEvent(pasteEvent);
+            }}
+            
+            // Method 3: Direct value set with React fiber hack
+            if (!input.value && !input.innerText) {{
+                const nativeSetter = Object.getOwnPropertyDescriptor(
+                    input.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype,
+                    'value'
+                )?.set;
+                if (nativeSetter) {{
+                    nativeSetter.call(input, text);
+                    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                }}
+            }}
+            
+            // Trigger events to update React state
+            input.dispatchEvent(new Event('input', {{bubbles: true, cancelable: true}}));
+            input.dispatchEvent(new Event('change', {{bubbles: true}}));
+            
+            // Wait then send
+            setTimeout(() => {{
+                const panelName = "{name}";
+                
+                // For DeepSeek, use Enter key directly (more reliable)
+                if (panelName === "DeepSeek") {{
+                    console.log('DeepSeek: Using Enter key to send');
+                    // Simulate Ctrl+Enter or just Enter
+                    input.dispatchEvent(new KeyboardEvent('keydown', {{
+                        key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+                        bubbles: true, cancelable: true
+                    }}));
+                    return;
+                }}
+                
+                // For ChatGPT, try the specific send button
+                const sendSelectors = "{config['send_selector']}".split(', ');
+                let sendBtn = null;
+                for (const sel of sendSelectors) {{
+                    try {{
+                        sendBtn = document.querySelector(sel);
+                        if (sendBtn && !sendBtn.disabled) break;
+                    }} catch(e) {{}}
+                }}
+                
+                if (sendBtn && !sendBtn.disabled) {{
+                    console.log('Clicking send:', sendBtn);
+                    sendBtn.click();
+                }} else {{
+                    // Fallback: Enter key
+                    console.log('Fallback: Enter key');
+                    input.dispatchEvent(new KeyboardEvent('keydown', {{
+                        key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true
+                    }}));
+                }}
+            }}, 500);
+            
+            return 'sent';
+        }})();
+        """
+        
+        panel.browser.page().runJavaScript(js_code, lambda r: print(f"Send to {name}: {r}"))
+
+
+class BrowserPanel(QFrame):
+    """A panel containing a browser view"""
+    
+    def __init__(self, config, profile, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.profile = profile
+        self.setup_ui()
+        
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        
+        # Minimal header
+        header = QWidget()
+        header.setFixedHeight(28)
+        header.setStyleSheet("background: #1a1a24;")
+        
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(10, 0, 10, 0)
+        
+        title = QLabel(f"{self.config['icon']} {self.config['name']}")
+        title.setStyleSheet(f"color: {self.config['color']}; font-size: 12px; font-weight: bold;")
+        header_layout.addWidget(title)
+        header_layout.addStretch()
+        
+        refresh_btn = QPushButton("⟳")
+        refresh_btn.setFixedSize(24, 24)
+        refresh_btn.setStyleSheet("""
+            QPushButton { background: transparent; color: #888; border: none; font-size: 14px; }
+            QPushButton:hover { color: white; }
+        """)
+        refresh_btn.clicked.connect(self.refresh)
+        header_layout.addWidget(refresh_btn)
+        
+        layout.addWidget(header)
+        
+        # Browser
+        self.browser = QWebEngineView()
+        page = QWebEnginePage(self.profile, self.browser)
+        self.browser.setPage(page)
+        self.browser.setUrl(QUrl(self.config['url']))
+        layout.addWidget(self.browser, stretch=1)
+        
+    def refresh(self):
+        self.browser.reload()
+
+
+class ControlPanel(QFrame):
+    """Control panel with initial prompts for both chatbots"""
+    
+    start_clicked = pyqtSignal(tuple)
+    stop_clicked = pyqtSignal()
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setup_ui()
+        
+    def setup_ui(self):
+        self.setStyleSheet("background: #1a1a24; border-top: 1px solid #2a2a3a;")
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(8)
+        
+        # Row 1: Prompt inputs
+        prompts_layout = QHBoxLayout()
+        
+        # ChatGPT prompt
+        chatgpt_frame = QFrame()
+        chatgpt_layout = QVBoxLayout(chatgpt_frame)
+        chatgpt_layout.setContentsMargins(0, 0, 0, 0)
+        chatgpt_layout.setSpacing(4)
+        
+        chatgpt_label = QLabel("◉ ChatGPT Initial Prompt:")
+        chatgpt_label.setStyleSheet("color: #10a37f; font-size: 11px; font-weight: bold;")
+        chatgpt_layout.addWidget(chatgpt_label)
+        
+        self.chatgpt_prompt = QTextEdit()
+        self.chatgpt_prompt.setMaximumHeight(60)
+        self.chatgpt_prompt.setPlaceholderText("Represent me, Alice, and create a dramatic improv scene with my friend, Bob...")
+        self.chatgpt_prompt.setStyleSheet("""
+            QTextEdit { background: #0f0f14; color: white; border: 1px solid #2a2a3a; border-radius: 4px; padding: 4px; font-size: 12px; }
+        """)
+        chatgpt_layout.addWidget(self.chatgpt_prompt)
+        prompts_layout.addWidget(chatgpt_frame)
+        
+        # DeepSeek prompt
+        deepseek_frame = QFrame()
+        deepseek_layout = QVBoxLayout(deepseek_frame)
+        deepseek_layout.setContentsMargins(0, 0, 0, 0)
+        deepseek_layout.setSpacing(4)
+        
+        deepseek_label = QLabel("◆ DeepSeek Initial Prompt:")
+        deepseek_label.setStyleSheet("color: #3b82f6; font-size: 11px; font-weight: bold;")
+        deepseek_layout.addWidget(deepseek_label)
+        
+        self.deepseek_prompt = QTextEdit()
+        self.deepseek_prompt.setMaximumHeight(60)
+        self.deepseek_prompt.setPlaceholderText("Represent me, Bob, and create a dramatic improv scene with my friend, Alice...")
+        self.deepseek_prompt.setStyleSheet("""
+            QTextEdit { background: #0f0f14; color: white; border: 1px solid #2a2a3a; border-radius: 4px; padding: 4px; font-size: 12px; }
+        """)
+        deepseek_layout.addWidget(self.deepseek_prompt)
+        prompts_layout.addWidget(deepseek_frame)
+        
+        layout.addLayout(prompts_layout)
+        
+        # Row 2: Buttons and status
+        controls_layout = QHBoxLayout()
+        
+        # Example dropdown
+        example_label = QLabel("📝 Examples:")
+        example_label.setStyleSheet("color: #888; font-size: 12px;")
+        controls_layout.addWidget(example_label)
+        
+        self.example_dropdown = QComboBox()
+        self.example_dropdown.setFixedWidth(250)
+        self.example_dropdown.setStyleSheet("""
+            QComboBox { 
+                background: #2a2a3a; color: white; border: 1px solid #3a3a4a; 
+                border-radius: 4px; padding: 6px; font-size: 12px; 
+            }
+            QComboBox:hover { border-color: #6366f1; }
+            QComboBox::drop-down { border: none; }
+            QComboBox::down-arrow { image: none; border: none; }
+            QComboBox QAbstractItemView { 
+                background: #2a2a3a; color: white; 
+                selection-background-color: #6366f1; 
+            }
+        """)
+        self.load_examples_from_file()
+        self.example_dropdown.currentIndexChanged.connect(self.on_example_selected)
+        controls_layout.addWidget(self.example_dropdown)
+        
+        controls_layout.addStretch()
+        
+        # Status
+        self.status_label = QLabel("Ready - Enter prompts and click Start")
+        self.status_label.setStyleSheet("color: #888; font-size: 12px;")
+        controls_layout.addWidget(self.status_label)
+        
+        controls_layout.addStretch()
+        
+        # Start button
+        self.start_btn = QPushButton("▶ Start Conversation")
+        self.start_btn.setFixedSize(140, 32)
+        self.start_btn.setStyleSheet("""
+            QPushButton { background: #10a37f; color: white; border: none; border-radius: 4px; font-weight: bold; font-size: 12px; }
+            QPushButton:hover { background: #0d8a6b; }
+        """)
+        self.start_btn.clicked.connect(self.on_start)
+        controls_layout.addWidget(self.start_btn)
+        
+        # Stop button
+        self.stop_btn = QPushButton("⬛ Stop")
+        self.stop_btn.setFixedSize(80, 32)
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.setStyleSheet("""
+            QPushButton { background: #e53935; color: white; border: none; border-radius: 4px; font-weight: bold; font-size: 12px; }
+            QPushButton:hover { background: #c62828; }
+            QPushButton:disabled { background: #444; }
+        """)
+        self.stop_btn.clicked.connect(self.on_stop)
+        controls_layout.addWidget(self.stop_btn)
+        
+        layout.addLayout(controls_layout)
+        
+    def load_examples_from_file(self):
+        """Load examples from the JSON file"""
+        self.examples = []
+        self.example_dropdown.addItem("Select an example...", None)
+        
+        try:
+            if os.path.exists(EXAMPLES_FILE):
+                with open(EXAMPLES_FILE, 'r') as f:
+                    data = json.load(f)
+                    self.examples = data.get('examples', [])
+                    
+                for i, ex in enumerate(self.examples):
+                    name = ex.get('name', f"Example {i+1}")
+                    self.example_dropdown.addItem(name, i)
+            else:
+                self.example_dropdown.addItem("No examples found", None)
+                print(f"Examples file not found at: {EXAMPLES_FILE}")
+        except Exception as e:
+            print(f"Error loading examples: {e}")
+            self.example_dropdown.addItem("Error loading examples", None)
+            
+    def on_example_selected(self, index):
+        """Handle dropdown selection"""
+        if index <= 0:  # The "Select an example..." item
+            return
+            
+        # Adjust for the placeholder item
+        example_idx = index - 1
+        if example_idx < len(self.examples):
+            ex = self.examples[example_idx]
+            self.chatgpt_prompt.setText(ex.get('chatgpt', ''))
+            self.deepseek_prompt.setText(ex.get('deepseek', ''))
+            self.status_label.setText(f"Loaded: {ex.get('name')}")
+            
+    def load_example(self):
+        # Legacy method kept for compatibility if needed
+        pass
+        
+    def on_start(self):
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.status_label.setText("� Starting...")
+        self.status_label.setStyleSheet("color: #10a37f; font-size: 12px;")
+        
+        prompts = (
+            self.chatgpt_prompt.toPlainText(),
+            self.deepseek_prompt.toPlainText()
+        )
+        self.start_clicked.emit(prompts)
+        
+    def on_stop(self):
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.status_label.setText("Stopped")
+        self.status_label.setStyleSheet("color: #888; font-size: 12px;")
+        self.stop_clicked.emit()
+        
+    def update_status(self, message):
+        self.status_label.setText(message)
+
+
+class MainWindow(QMainWindow):
+    """Main application window"""
+    
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("AI Brainstorm - ChatGPT ↔ DeepSeek")
+        self.setMinimumSize(1300, 900)
+        
+        self.setup_persistent_profile()
+        self.setup_ui()
+        self.setup_bridge()
+        
+    def setup_persistent_profile(self):
+        os.makedirs(STORAGE_DIR, exist_ok=True)
+        self.profile = QWebEngineProfile("brainstorm_profile", self)
+        self.profile.setPersistentStoragePath(STORAGE_DIR)
+        self.profile.setCachePath(os.path.join(STORAGE_DIR, "cache"))
+        self.profile.setPersistentCookiesPolicy(
+            QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies
+        )
+        
+    def setup_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        
+        # Browser panels
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setStyleSheet("""
+            QSplitter { background: #0f0f14; }
+            QSplitter::handle { background: #2a2a3a; width: 2px; }
+        """)
+        
+        self.panels = []
+        for config in CHATBOTS:
+            panel = BrowserPanel(config, self.profile)
+            self.panels.append(panel)
+            splitter.addWidget(panel)
+        
+        splitter.setSizes([650, 650])
+        main_layout.addWidget(splitter, stretch=1)
+        
+        # Control panel
+        self.control_panel = ControlPanel()
+        main_layout.addWidget(self.control_panel)
+        
+        self.statusBar().hide()
+        self.setStyleSheet("QMainWindow { background: #0f0f14; }")
+        
+    def setup_bridge(self):
+        self.bridge = ChatBridge()
+        self.bridge.set_panels(self.panels)
+        self.bridge.status_update.connect(self.control_panel.update_status)
+        self.bridge.message_received.connect(
+            lambda idx, msg: self.control_panel.update_status(f"✓ {CHATBOTS[idx]['name']}: {msg[:50]}...")
+        )
+        
+        self.control_panel.start_clicked.connect(self.bridge.start)
+        self.control_panel.stop_clicked.connect(self.bridge.stop)
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setStyle('Fusion')
+    
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, QColor(15, 15, 20))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor(255, 255, 255))
+    palette.setColor(QPalette.ColorRole.Base, QColor(22, 22, 29))
+    palette.setColor(QPalette.ColorRole.Text, QColor(255, 255, 255))
+    app.setPalette(palette)
+    
+    window = MainWindow()
+    window.show()
+    
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
