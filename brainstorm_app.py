@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-AI Brainstorm Panel - ChatGPT ↔ DeepSeek Auto-Conversation
+AI Brainstorm Panel - LLM ↔ LLM Auto-Conversation
 G2G-style peer-to-peer communication between two AI chatbots
+Supports: ChatGPT, DeepSeek, Gemini, Claude
 """
 
 import sys
@@ -25,9 +26,9 @@ EXAMPLES_FILE = os.path.join(SCRIPT_DIR, "examples.json")
 # Persistent storage directory
 STORAGE_DIR = os.path.expanduser("~/.brainstorm_panel")
 
-# Chatbot configurations
-CHATBOTS = [
-    {
+# Available chatbot configurations
+AVAILABLE_CHATBOTS = {
+    "ChatGPT": {
         "name": "ChatGPT",
         "url": "https://chat.openai.com",
         "color": "#10a37f",
@@ -36,16 +37,39 @@ CHATBOTS = [
         "send_selector": "button[data-testid='send-button']",
         "response_selector": "[data-message-author-role='assistant']",
     },
-    {
+    "DeepSeek": {
         "name": "DeepSeek", 
         "url": "https://chat.deepseek.com",
         "color": "#3b82f6",
         "icon": "◆",
-        # Multiple selectors to try
         "input_selector": "textarea, #chat-input, [contenteditable='true']",
         "send_selector": "button[type='submit'], button:has(svg), div[role='button']",
         "response_selector": ".ds-markdown, .message-content, [class*='answer'], [class*='response']",
     },
+    "Gemini": {
+        "name": "Gemini",
+        "url": "https://gemini.google.com/app",
+        "color": "#8e44ad",
+        "icon": "✦",
+        "input_selector": "rich-textarea .ql-editor, .text-input-field textarea, [contenteditable='true']",
+        "send_selector": "button[aria-label='Send message'], button.send-button, button[mat-icon-button]",
+        "response_selector": ".model-response-text, .response-content, message-content[class*='model']",
+    },
+    "Claude": {
+        "name": "Claude",
+        "url": "https://claude.ai/new",
+        "color": "#d97706",
+        "icon": "◈",
+        "input_selector": "[contenteditable='true'].ProseMirror, div[contenteditable='true'], fieldset textarea",
+        "send_selector": "button[aria-label='Send Message'], button[type='submit']:not(:disabled)",
+        "response_selector": "[data-is-streaming], .font-claude-message, [class*='claude-message']",
+    },
+}
+
+# Default chatbot selection (will be updated by UI)
+CHATBOTS = [
+    AVAILABLE_CHATBOTS["ChatGPT"],
+    AVAILABLE_CHATBOTS["DeepSeek"],
 ]
 
 # Template for forwarding messages (G2G style)
@@ -68,33 +92,47 @@ class ChatBridge(QObject):
         self.check_timer = QTimer()
         self.check_timer.timeout.connect(self.check_for_responses)
         self.waiting_for_panel = -1  # Which panel we're waiting for (-1 = none)
-        self.deepseek_initial_prompt = ""  # Store DeepSeek prompt for later
+        self.right_panel_initial_prompt = ""  # Store right panel prompt for later
         self.last_text_check = ""  # For stability check
         self.stable_count = 0  # Count how many times text is stable
+        self.get_chatbots = None  # Function to get current chatbot configs
         
     def set_panels(self, panels):
         self.panels = panels
+    
+    def set_chatbot_getter(self, getter):
+        """Set the function to get current chatbot configurations"""
+        self.get_chatbots = getter
+    
+    def get_current_chatbots(self):
+        """Get the current chatbot configurations"""
+        if self.get_chatbots:
+            return self.get_chatbots()
+        return CHATBOTS
         
     def start(self, initial_prompts):
-        """Start the conversation - send to ChatGPT first, wait for response"""
+        """Start the conversation - send to left panel first, wait for response"""
         self.is_running = True
         self.last_response_count = [0, 0]
         self.last_response_text = ["", ""]
         self.stable_count = 0
         self.last_text_check = ""
         
-        # Store DeepSeek prompt for later (will be sent after ChatGPT responds)
-        prompt1, prompt2 = initial_prompts
-        self.deepseek_initial_prompt = prompt2
+        chatbots = self.get_current_chatbots()
+        left_name = chatbots[0]['name']
         
-        # Only send to ChatGPT first
+        # Store right panel prompt for later (will be sent after left panel responds)
+        prompt1, prompt2 = initial_prompts
+        self.right_panel_initial_prompt = prompt2
+        
+        # Only send to left panel first
         if prompt1.strip():
-            print("[Start] Sending initial prompt to ChatGPT only...")
+            print(f"[Start] Sending initial prompt to {left_name} only...")
             self.send_message(0, prompt1)
             
-        # Wait for ChatGPT to respond
+        # Wait for left panel to respond
         self.waiting_for_panel = 0
-        self.status_update.emit("⏳ Waiting for ChatGPT to respond...")
+        self.status_update.emit(f"⏳ Waiting for {left_name} to respond...")
         
         # Start checking for responses after a delay
         QTimer.singleShot(5000, lambda: self.check_timer.start(2000))
@@ -119,7 +157,8 @@ class ChatBridge(QObject):
             return
             
         panel = self.panels[index]
-        config = CHATBOTS[index]
+        chatbots = self.get_current_chatbots()
+        config = chatbots[index]
         name = config['name']
         
         # JavaScript to get the last response and check if streaming
@@ -197,7 +236,8 @@ class ChatBridge(QObject):
             
             count = data.get('count', 0)
             text = data.get('text', '')
-            name = CHATBOTS[panel_index]['name']
+            chatbots = self.get_current_chatbots()
+            name = chatbots[panel_index]['name']
             
             # Use text stability instead of streaming indicators
             # If text hasn't changed for 2 checks, consider response complete
@@ -230,12 +270,12 @@ class ChatBridge(QObject):
                     
                     # Forward to the other panel
                     other_index = 1 - panel_index
-                    other_name = CHATBOTS[other_index]['name']
+                    other_name = chatbots[other_index]['name']
                     
-                    # For the first ChatGPT response, send DeepSeek's initial prompt + ChatGPT's response
-                    if panel_index == 0 and self.deepseek_initial_prompt:
-                        message_to_send = self.deepseek_initial_prompt + "\n\nThe first round from the opposite party:\n\n" + text
-                        self.deepseek_initial_prompt = ""  # Clear it
+                    # For the first left panel response, send right panel's initial prompt + left panel's response
+                    if panel_index == 0 and self.right_panel_initial_prompt:
+                        message_to_send = self.right_panel_initial_prompt + "\n\nThe first round from the opposite party:\n\n" + text
+                        self.right_panel_initial_prompt = ""  # Clear it
                     else:
                         message_to_send = FORWARD_TEMPLATE.format(message=text)
                     
@@ -258,7 +298,8 @@ class ChatBridge(QObject):
             return
             
         panel = self.panels[panel_index]
-        config = CHATBOTS[panel_index]
+        chatbots = self.get_current_chatbots()
+        config = chatbots[panel_index]
         name = config['name']
         
         self.status_update.emit(f"📤 Sending to {name}...")
@@ -388,9 +429,9 @@ class BrowserPanel(QFrame):
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(10, 0, 10, 0)
         
-        title = QLabel(f"{self.config['icon']} {self.config['name']}")
-        title.setStyleSheet(f"color: {self.config['color']}; font-size: 12px; font-weight: bold;")
-        header_layout.addWidget(title)
+        self.title = QLabel(f"{self.config['icon']} {self.config['name']}")
+        self.title.setStyleSheet(f"color: {self.config['color']}; font-size: 12px; font-weight: bold;")
+        header_layout.addWidget(self.title)
         header_layout.addStretch()
         
         refresh_btn = QPushButton("⟳")
@@ -413,6 +454,13 @@ class BrowserPanel(QFrame):
         
     def refresh(self):
         self.browser.reload()
+    
+    def set_chatbot(self, config):
+        """Change the chatbot for this panel"""
+        self.config = config
+        self.title.setText(f"{config['icon']} {config['name']}")
+        self.title.setStyleSheet(f"color: {config['color']}; font-size: 12px; font-weight: bold;")
+        self.browser.setUrl(QUrl(config['url']))
 
 
 class ControlPanel(QFrame):
@@ -420,9 +468,11 @@ class ControlPanel(QFrame):
     
     start_clicked = pyqtSignal(tuple)
     stop_clicked = pyqtSignal()
+    llm_changed = pyqtSignal(int, str)  # panel_index, llm_name
     
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.selected_llms = ["ChatGPT", "DeepSeek"]  # Default selection
         self.setup_ui()
         
     def setup_ui(self):
@@ -432,18 +482,75 @@ class ControlPanel(QFrame):
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(8)
         
+        # Row 0: LLM Selection dropdowns
+        llm_selection_layout = QHBoxLayout()
+        
+        # Left LLM selector
+        left_llm_frame = QFrame()
+        left_llm_layout = QHBoxLayout(left_llm_frame)
+        left_llm_layout.setContentsMargins(0, 0, 0, 0)
+        left_llm_layout.setSpacing(8)
+        
+        left_llm_label = QLabel("Left Panel:")
+        left_llm_label.setStyleSheet("color: #888; font-size: 11px;")
+        left_llm_layout.addWidget(left_llm_label)
+        
+        self.left_llm_dropdown = QComboBox()
+        self.left_llm_dropdown.setFixedWidth(120)
+        for name in AVAILABLE_CHATBOTS.keys():
+            self.left_llm_dropdown.addItem(f"{AVAILABLE_CHATBOTS[name]['icon']} {name}", name)
+        self.left_llm_dropdown.setCurrentText(f"{AVAILABLE_CHATBOTS['ChatGPT']['icon']} ChatGPT")
+        self.left_llm_dropdown.setStyleSheet("""
+            QComboBox { background: #2a2a3a; color: white; border: 1px solid #3a3a4a; border-radius: 4px; padding: 4px 8px; font-size: 11px; }
+            QComboBox:hover { border-color: #6366f1; }
+            QComboBox::drop-down { border: none; }
+            QComboBox QAbstractItemView { background: #2a2a3a; color: white; selection-background-color: #6366f1; }
+        """)
+        self.left_llm_dropdown.currentIndexChanged.connect(lambda: self.on_llm_changed(0))
+        left_llm_layout.addWidget(self.left_llm_dropdown)
+        left_llm_layout.addStretch()
+        llm_selection_layout.addWidget(left_llm_frame)
+        
+        # Right LLM selector
+        right_llm_frame = QFrame()
+        right_llm_layout = QHBoxLayout(right_llm_frame)
+        right_llm_layout.setContentsMargins(0, 0, 0, 0)
+        right_llm_layout.setSpacing(8)
+        
+        right_llm_label = QLabel("Right Panel:")
+        right_llm_label.setStyleSheet("color: #888; font-size: 11px;")
+        right_llm_layout.addWidget(right_llm_label)
+        
+        self.right_llm_dropdown = QComboBox()
+        self.right_llm_dropdown.setFixedWidth(120)
+        for name in AVAILABLE_CHATBOTS.keys():
+            self.right_llm_dropdown.addItem(f"{AVAILABLE_CHATBOTS[name]['icon']} {name}", name)
+        self.right_llm_dropdown.setCurrentIndex(1)  # Default to DeepSeek
+        self.right_llm_dropdown.setStyleSheet("""
+            QComboBox { background: #2a2a3a; color: white; border: 1px solid #3a3a4a; border-radius: 4px; padding: 4px 8px; font-size: 11px; }
+            QComboBox:hover { border-color: #6366f1; }
+            QComboBox::drop-down { border: none; }
+            QComboBox QAbstractItemView { background: #2a2a3a; color: white; selection-background-color: #6366f1; }
+        """)
+        self.right_llm_dropdown.currentIndexChanged.connect(lambda: self.on_llm_changed(1))
+        right_llm_layout.addWidget(self.right_llm_dropdown)
+        right_llm_layout.addStretch()
+        llm_selection_layout.addWidget(right_llm_frame)
+        
+        layout.addLayout(llm_selection_layout)
+        
         # Row 1: Prompt inputs
         prompts_layout = QHBoxLayout()
         
-        # ChatGPT prompt
-        chatgpt_frame = QFrame()
-        chatgpt_layout = QVBoxLayout(chatgpt_frame)
-        chatgpt_layout.setContentsMargins(0, 0, 0, 0)
-        chatgpt_layout.setSpacing(4)
+        # Left panel prompt
+        self.left_prompt_frame = QFrame()
+        left_prompt_layout = QVBoxLayout(self.left_prompt_frame)
+        left_prompt_layout.setContentsMargins(0, 0, 0, 0)
+        left_prompt_layout.setSpacing(4)
         
-        chatgpt_label = QLabel("◉ ChatGPT Initial Prompt:")
-        chatgpt_label.setStyleSheet("color: #10a37f; font-size: 11px; font-weight: bold;")
-        chatgpt_layout.addWidget(chatgpt_label)
+        self.left_prompt_label = QLabel("◉ ChatGPT Initial Prompt:")
+        self.left_prompt_label.setStyleSheet("color: #10a37f; font-size: 11px; font-weight: bold;")
+        left_prompt_layout.addWidget(self.left_prompt_label)
         
         self.chatgpt_prompt = QTextEdit()
         self.chatgpt_prompt.setMaximumHeight(60)
@@ -451,18 +558,18 @@ class ControlPanel(QFrame):
         self.chatgpt_prompt.setStyleSheet("""
             QTextEdit { background: #0f0f14; color: white; border: 1px solid #2a2a3a; border-radius: 4px; padding: 4px; font-size: 12px; }
         """)
-        chatgpt_layout.addWidget(self.chatgpt_prompt)
-        prompts_layout.addWidget(chatgpt_frame)
+        left_prompt_layout.addWidget(self.chatgpt_prompt)
+        prompts_layout.addWidget(self.left_prompt_frame)
         
-        # DeepSeek prompt
-        deepseek_frame = QFrame()
-        deepseek_layout = QVBoxLayout(deepseek_frame)
-        deepseek_layout.setContentsMargins(0, 0, 0, 0)
-        deepseek_layout.setSpacing(4)
+        # Right panel prompt
+        self.right_prompt_frame = QFrame()
+        right_prompt_layout = QVBoxLayout(self.right_prompt_frame)
+        right_prompt_layout.setContentsMargins(0, 0, 0, 0)
+        right_prompt_layout.setSpacing(4)
         
-        deepseek_label = QLabel("◆ DeepSeek Initial Prompt:")
-        deepseek_label.setStyleSheet("color: #3b82f6; font-size: 11px; font-weight: bold;")
-        deepseek_layout.addWidget(deepseek_label)
+        self.right_prompt_label = QLabel("◆ DeepSeek Initial Prompt:")
+        self.right_prompt_label.setStyleSheet("color: #3b82f6; font-size: 11px; font-weight: bold;")
+        right_prompt_layout.addWidget(self.right_prompt_label)
         
         self.deepseek_prompt = QTextEdit()
         self.deepseek_prompt.setMaximumHeight(60)
@@ -470,8 +577,8 @@ class ControlPanel(QFrame):
         self.deepseek_prompt.setStyleSheet("""
             QTextEdit { background: #0f0f14; color: white; border: 1px solid #2a2a3a; border-radius: 4px; padding: 4px; font-size: 12px; }
         """)
-        deepseek_layout.addWidget(self.deepseek_prompt)
-        prompts_layout.addWidget(deepseek_frame)
+        right_prompt_layout.addWidget(self.deepseek_prompt)
+        prompts_layout.addWidget(self.right_prompt_frame)
         
         layout.addLayout(prompts_layout)
         
@@ -572,6 +679,29 @@ class ControlPanel(QFrame):
     def load_example(self):
         # Legacy method kept for compatibility if needed
         pass
+    
+    def on_llm_changed(self, panel_index):
+        """Handle LLM selection change"""
+        if panel_index == 0:
+            llm_name = self.left_llm_dropdown.currentData()
+            config = AVAILABLE_CHATBOTS[llm_name]
+            self.left_prompt_label.setText(f"{config['icon']} {llm_name} Initial Prompt:")
+            self.left_prompt_label.setStyleSheet(f"color: {config['color']}; font-size: 11px; font-weight: bold;")
+        else:
+            llm_name = self.right_llm_dropdown.currentData()
+            config = AVAILABLE_CHATBOTS[llm_name]
+            self.right_prompt_label.setText(f"{config['icon']} {llm_name} Initial Prompt:")
+            self.right_prompt_label.setStyleSheet(f"color: {config['color']}; font-size: 11px; font-weight: bold;")
+        
+        self.selected_llms[panel_index] = llm_name
+        self.llm_changed.emit(panel_index, llm_name)
+        
+    def get_selected_chatbots(self):
+        """Return the current chatbot configurations"""
+        return [
+            AVAILABLE_CHATBOTS[self.selected_llms[0]],
+            AVAILABLE_CHATBOTS[self.selected_llms[1]],
+        ]
         
     def on_start(self):
         self.start_btn.setEnabled(False)
@@ -601,7 +731,7 @@ class MainWindow(QMainWindow):
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AI Brainstorm - ChatGPT ↔ DeepSeek")
+        self.setWindowTitle("AI Brainstorm - LLM ↔ LLM")
         self.setMinimumSize(1300, 900)
         
         self.setup_persistent_profile()
@@ -651,13 +781,20 @@ class MainWindow(QMainWindow):
     def setup_bridge(self):
         self.bridge = ChatBridge()
         self.bridge.set_panels(self.panels)
+        self.bridge.set_chatbot_getter(self.control_panel.get_selected_chatbots)
         self.bridge.status_update.connect(self.control_panel.update_status)
         self.bridge.message_received.connect(
-            lambda idx, msg: self.control_panel.update_status(f"✓ {CHATBOTS[idx]['name']}: {msg[:50]}...")
+            lambda idx, msg: self.control_panel.update_status(f"✓ {self.control_panel.get_selected_chatbots()[idx]['name']}: {msg[:50]}...")
         )
         
         self.control_panel.start_clicked.connect(self.bridge.start)
         self.control_panel.stop_clicked.connect(self.bridge.stop)
+        self.control_panel.llm_changed.connect(self.on_llm_changed)
+    
+    def on_llm_changed(self, panel_index, llm_name):
+        """Handle LLM selection change"""
+        config = AVAILABLE_CHATBOTS[llm_name]
+        self.panels[panel_index].set_chatbot(config)
 
 
 def main():
